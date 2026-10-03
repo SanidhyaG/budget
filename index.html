@@ -513,6 +513,7 @@ const pending = () => Object.keys(out).length;
 /* ================================================================== */
 
 let syncing = null, syncAgain = false, wantFull = false, busy = false, fails = 0;
+let connecting = false;   // keeps the Connect screen up until the first load succeeds
 let debounceTimer = null, retryTimer = null;
 
 function scheduleSync(ms) {
@@ -601,16 +602,21 @@ async function syncOnce() {
       applyOutbox();
       saveDb();
       meta.hasLoans = !!(p.tables && Object.prototype.hasOwnProperty.call(p.tables, 'Loans'));
+      // Older scripts send accounts without a dueDay field at all.
+      const accs = (p.tables && p.tables.Accounts) || [];
+      meta.hasDueDay = accs.length ? accs.some((a) => Object.prototype.hasOwnProperty.call(a, 'dueDay')) : undefined;
       if (p.sheetUrl) meta.sheetUrl = p.sheetUrl;
       rev++;
     }
     meta.version = p.version;
     meta.lastSync = Date.now();
     meta.error = null;
+    meta.errorDetail = '';
     fails = 0;
     ok = true;
   } catch (e) {
     meta.error = e.code || 'network';
+    meta.errorDetail = e.code === 'server_error' || !ERR_TEXT[e.code] ? String(e.message || '') : '';
     if (!STOP_ERRORS[meta.error]) {
       const wait = BACKOFF[Math.min(fails, BACKOFF.length - 1)] * 1000;
       fails++;
@@ -794,6 +800,43 @@ function markPaid(rec, d) {
   });
   showToast((rec.type === 'income' ? 'Received ' : 'Paid ') + usd(toCents(rec.amount)) + ' for ' + rec.name, { undo: () => del('Transactions', occId(rec, d)) });
 }
+/**
+ * Credit card payments coming up (next 7 days) or recently missed (last 10 days).
+ * A card payment is a transfer, never spending. A cycle counts as paid once any
+ * transfer into the card is dated after the previous due date; Skip leaves a
+ * tombstone "cs-<account id>-<due date>".
+ */
+function cardDues() {
+  const D = derive();
+  const t = today(), from = addDays(t, -10), to = addDays(t, 7);
+  const res = [];
+  for (const a of D.accounts) {
+    if (a.kind !== 'credit' || !isNum(a.dueDay) || a.dueDay < 1 || a.dueDay > 31) continue;
+    const owed = -(D.bal[a.name] || 0);
+    if (owed <= 0) continue;
+    const day = Math.round(a.dueDay);
+    const dueIn = (mk) => { const [y, m] = mk.split('-').map(Number); return mk + '-' + pad(Math.min(day, dim(y, m))); };
+    for (const k of [-1, 0, 1]) {
+      const mk = addMonths(t.slice(0, 7), k);
+      const d = dueIn(mk);
+      if (d < from || d > to) continue;
+      const prev = dueIn(addMonths(mk, -1));
+      if (db.tombs['cs-' + a.id + '-' + d]) continue;
+      if (D.txns.some((r) => r.type === 'transfer' && r.toAccount === a.name && r.date > prev && r.date <= t)) continue;
+      res.push({ card: a, d, owed });
+    }
+  }
+  return res;
+}
+/** Where a card payment comes from by default: the last account used, unless that is a card. */
+function payFromAccount() {
+  const D = derive();
+  const last = D.accounts.find((a) => a.name === meta.lastAccount && a.kind !== 'credit');
+  if (last) return last.name;
+  const bank = D.accounts.find((a) => a.kind === 'bank') || D.accounts.find((a) => a.kind !== 'credit');
+  return bank ? bank.name : '';
+}
+
 function markSkipped(rec, d) {
   del('Transactions', occId(rec, d));
   showToast('Skipped ' + rec.name + ' for ' + fd(d), { undo: () => put('Transactions', {
@@ -1161,7 +1204,7 @@ const tag = (status) => '<span class="tag ' + status + '">' + ({ confirmed: 'Con
 
 function render() {
   updatePill();
-  if (!meta.url) { renderConnect(); return; }
+  if (!meta.url || connecting) { renderConnect(); return; }
   $('#app').classList.remove('hidden');
   const cn = $('#connect'); if (cn) cn.remove();
   const titles = { home: 'Home', activity: 'Activity', plan: 'Plan', accounts: 'Accounts' };
@@ -1246,10 +1289,16 @@ function viewHome() {
     const t = today(), horizon = addDays(t, 7);
     const due = [];
     for (const rec of D.recurring) for (const d of undone(rec, horizon)) if (!rec.auto || d > t) due.push({ rec, d });
+    for (const c of cardDues()) due.push(c);
     due.sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
     if (due.length) {
-      h += '<h2>Due soon</h2><ul class="list" id="due-soon">' + due.map(({ rec, d }) => {
+      h += '<h2>Due soon</h2><ul class="list" id="due-soon">' + due.map(({ rec, d, card, owed }) => {
         const when = d < t ? 'Overdue since ' + fd(d) : d === t ? 'Due today' : 'Due ' + fdSmart(d).replace('Tomorrow', 'tomorrow');
+        if (card) {
+          return '<li class="row" data-card="' + esc(card.name) + '"><span class="main"><span class="t" style="display:block">' + esc(card.name) + ' payment</span><span class="s' + (d < t ? ' left-warn' : '') + '">' +
+            esc(when) + ', ' + usd(owed) + ' owed now</span></span><span class="acts"><button class="btn small" type="button" data-act="card-pay" data-id="' + esc(card.id) + '">Pay</button>' +
+            '<button class="btn small" type="button" data-act="card-skip" data-id="' + esc(card.id) + '" data-d="' + d + '">Skip</button></span></li>';
+        }
         const acts = rec.auto ? '<span class="s">Logs automatically</span>' :
           '<span class="acts"><button class="btn small" type="button" data-act="paid" data-id="' + esc(rec.id) + '" data-d="' + d + '">' + (rec.type === 'income' ? 'Received' : 'Paid') +
           '</button><button class="btn small" type="button" data-act="skip" data-id="' + esc(rec.id) + '" data-d="' + d + '">Skip</button></span>';
@@ -1523,7 +1572,7 @@ function viewAccounts() {
     const b = D.bal[a.name] || 0;
     const shown = a.kind === 'credit' && b < 0 ? '<span class="amt">' + usd(-b) + ' owed</span>' : '<span class="amt">' + usd(b) + '</span>';
     return '<li><button type="button" class="row" data-act="edit-acc" data-id="' + esc(a.id) + '" data-name="' + esc(a.name) + '"><span class="ic" aria-hidden="true">' + (KIND_ICON[a.kind] || '📁') + '</span><span class="main"><span class="t" style="display:block">' + esc(a.name) +
-      '</span><span class="s">' + esc(KIND_LABEL[a.kind] || a.kind) + '</span></span><span class="end" data-balance="' + esc(a.name) + '">' + shown + '</span></button></li>';
+      '</span><span class="s">' + esc(KIND_LABEL[a.kind] || a.kind) + (a.kind === 'credit' && isNum(a.dueDay) && a.dueDay >= 1 ? ', due on the ' + ordinal(Math.round(a.dueDay)) : '') + '</span></span><span class="end" data-balance="' + esc(a.name) + '">' + shown + '</span></button></li>';
   }).join('') + '</ul>';
   h += '<div class="btns"><button class="btn" type="button" data-act="transfer">Transfer money</button><button class="btn" type="button" data-act="new-acc">Add account</button></div>';
   return h;
@@ -1576,11 +1625,11 @@ function openEntry(opts) {
   const st = {
     mode: tx ? 'edit' : 'add',
     type: tx ? tx.type : opts.goal ? 'save' : (opts.type || 'expense'),
-    expr: tx ? exprFromCents(Math.abs(toCents(tx.amount))) : '',
+    expr: tx ? exprFromCents(Math.abs(toCents(tx.amount))) : opts.amount > 0 ? exprFromCents(opts.amount) : '',
     date: tx ? tx.date : today(),
-    account: tx ? tx.account : defaultAccount(),
-    toAccount: tx ? tx.toAccount : '',
-    note: tx ? tx.note : '',
+    account: tx ? tx.account : opts.account || defaultAccount(),
+    toAccount: tx ? tx.toAccount : opts.toAccount || '',
+    note: tx ? tx.note : opts.note || '',
     category: tx ? tx.category : '',
     goal: tx ? tx.goal : opts.goal || '',
     dir: tx ? (toCents(tx.amount) < 0 ? 'out' : 'in') : (opts.dir || 'in'),
@@ -1781,9 +1830,15 @@ function formAccount(acc) {
     field('Kind', '<select id="f-kind">' + KINDS.map((k) => opt(k, KIND_LABEL[k], acc.kind)).join('') + '</select>') +
     field(owed ? 'Amount owed now' : 'Current balance', '<input id="f-bal" inputmode="decimal" value="' + esc(centsInput(owed ? -balNow : balNow)) + '" placeholder="0">',
       'What the account shows today. For a credit card, enter what you owe.') +
+    '<div id="f-duebox"' + (owed ? '' : ' class="hidden"') + '>' +
+    field('Payment due day', '<input id="f-due" inputmode="numeric" maxlength="2" value="' + esc(isNum(acc.dueDay) ? String(Math.round(acc.dueDay)) : '') + '" placeholder="For example, 12">',
+      'Day of the month the card payment is due. It then shows under Due soon with what you owe. Leave blank for none.' +
+      (meta.hasDueDay === false ? ' <strong>Update the script first (see SETUP.md), or the Sheet will not keep this.</strong>' : '')) + '</div>' +
     '<div class="err" role="alert"></div><div class="btns">' + (isNew ? '' : '<button class="btn danger" type="button" data-x="del">Delete</button>') + '<button class="btn primary" type="button" data-x="save">Save</button></div>', { name: 'form-account' });
   m.sheet.addEventListener('change', (e) => {
-    if (e.target.id === 'f-kind') $('#f-bal', m.sheet).closest('.field').firstChild.textContent = e.target.value === 'credit' ? 'Amount owed now' : 'Current balance';
+    if (e.target.id !== 'f-kind') return;
+    $('#f-bal', m.sheet).closest('.field').firstChild.textContent = e.target.value === 'credit' ? 'Amount owed now' : 'Current balance';
+    $('#f-duebox', m.sheet).classList.toggle('hidden', e.target.value !== 'credit');
   });
   m.sheet.addEventListener('click', (e) => {
     const b = e.target.closest('[data-x]'); if (!b) return;
@@ -1797,6 +1852,9 @@ function formAccount(acc) {
     if (!name) return setErr(m, 'Give it a name');
     if (nameTaken('Accounts', name, acc.id)) return setErr(m, 'There is already an account with that name');
     if (Number.isNaN(want)) return setErr(m, 'Balance must be an amount like 1250.50');
+    const dueRaw = kind === 'credit' ? val(m, 'f-due') : '';
+    const dueDay = dueRaw === '' ? null : Number(dueRaw);
+    if (dueDay !== null && !(Number.isInteger(dueDay) && dueDay >= 1 && dueDay <= 31)) return setErr(m, 'Due day must be a day of the month, 1 to 31');
     want = want || 0;
     if (kind === 'credit') want = -Math.abs(want);
     // Back-solve the opening balance from the balance the person sees today.
@@ -1804,7 +1862,7 @@ function formAccount(acc) {
     const old = acc.name;
     closeModal(m);
     batch(() => {
-      put('Accounts', Object.assign({}, acc, { name, kind, opening: (isNew ? want : opening) / 100 }));
+      put('Accounts', Object.assign({}, acc, { name, kind, opening: (isNew ? want : opening) / 100, dueDay }));
       if (!isNew) cascade('account', old, name);
     });
   });
@@ -2134,7 +2192,7 @@ function formQuestion(q) {
 function settingsHTML() {
   const D = derive();
   const n = pending();
-  const err = meta.error ? (ERR_TEXT[meta.error] || 'Something went wrong (' + meta.error + '). It will try again shortly.') : '';
+  const err = meta.error ? (ERR_TEXT[meta.error] || 'Something went wrong (' + meta.error + '). It will try again shortly.') + (meta.errorDetail ? ' Detail: ' + meta.errorDetail : '') : '';
   const label = (t) => ({ Transactions: 'Entry', Categories: 'Category', Accounts: 'Account', Recurring: 'Recurring item', Goals: 'Goal', LoanDisbursements: 'Loan disbursement', LoanPayments: 'Loan payment', LoanRates: 'Loan rate' })[t] || t;
   const describe = (i) => {
     const r = i.row;
@@ -2203,20 +2261,24 @@ async function connect() {
   if (parts.length !== 3 || parts[0] !== 'BT1' || !/^https?:\/\/\S+$/.test(parts[1]) || !parts[2]) { errEl.textContent = ERR_TEXT.bad_code; return; }
   const conn = { url: parts[1], key: parts[2] };
   btn.disabled = true; btn.textContent = 'Connecting';
+  connecting = true;
   try {
     const r = await api('GET', { action: 'ping' }, conn);
     if (r.app !== 'budget-tracker') throw apiError('wrong_app');
     db = emptyDb(); out = {}; meta = { url: conn.url, key: conn.key };
     saveDb(); saveOut(); saveMeta();
     await sync({ full: true });
-    if (meta.error) throw apiError(meta.error);
-    $('#connect').remove();
+    if (meta.error) throw apiError(meta.error, meta.errorDetail);
+    connecting = false;
+    const cn = $('#connect'); if (cn) cn.remove();
     ui.view = 'home';
     render();
     showToast('Connected to your Sheet');
   } catch (e) {
     if (meta.url === conn.url && meta.error) { meta = {}; saveMeta(); }
-    errEl.textContent = ERR_TEXT[e.code] || ('Could not connect (' + (e.code || e.message) + ').');
+    connecting = false;
+    errEl.textContent = (ERR_TEXT[e.code] || 'Could not connect.') + ' Error code: ' + (e.code || 'unknown') +
+      (e.message && e.message !== e.code ? ' (' + e.message + ')' : '') + '.';
   } finally {
     btn.disabled = false; btn.textContent = 'Connect';
   }
@@ -2237,6 +2299,16 @@ const actions = {
     const r = db.tables.Transactions[b.dataset.id]; if (!r) return;
     const p = derive().loanTxnIds[r.id];
     if (p) formPayment(p); else openEntry({ txn: r });
+  },
+  'card-pay': (b) => {
+    const card = db.tables.Accounts[b.dataset.id]; if (!card) return;
+    const owed = -(derive().bal[card.name] || 0);
+    openEntry({ type: 'transfer', account: payFromAccount(), toAccount: card.name, amount: Math.max(0, owed), note: card.name + ' payment' });
+  },
+  'card-skip': (b) => {
+    const card = db.tables.Accounts[b.dataset.id]; if (!card) return;
+    del('Transactions', 'cs-' + card.id + '-' + b.dataset.d);
+    showToast(card.name + ' payment hidden until next month');
   },
   paid: (b) => { const rec = db.tables.Recurring[b.dataset.id]; if (rec) markPaid(rec, b.dataset.d); },
   skip: (b) => { const rec = db.tables.Recurring[b.dataset.id]; if (rec) markSkipped(rec, b.dataset.d); },
